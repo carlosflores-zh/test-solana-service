@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -424,6 +425,17 @@ func MonitorDockerLogs(ctx context.Context, containerName string, txUUID string,
 	}
 }
 
+// TransactionResult represents the result of a single transaction
+type TransactionResult struct {
+	TxID               string
+	RunID              int
+	TotalDuration      time.Duration
+	SignDuration       time.Duration
+	LogMonitorDuration time.Duration
+	LogState           *DockerLogState
+	Error              error
+}
+
 // Example usage of the SignTransaction function
 func main() {
 	jsonHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -435,111 +447,148 @@ func main() {
 	ctx := context.Background()
 
 	// Variables to store aggregated timing data
-	numTransactions := 50
+	numTransactions := 100
+	results := make(chan TransactionResult, numTransactions)
+	var wg sync.WaitGroup
+
+	// Start timing for the entire batch
+	batchStartTime := time.Now()
+	slog.Info("Starting parallel transaction batch", "total_transactions", numTransactions)
+
+	// Launch goroutines for each transaction
+	for runID := range make([]int, numTransactions) {
+		wg.Add(1)
+		go func(runID int) {
+			defer wg.Done()
+
+			// Start the overall transaction timing
+			txStartTime := time.Now()
+
+			// Generate a unique transaction ID (UUID)
+			txUUID := uuid.New().String()
+			slog.Info("Starting transaction flow", "tx_id", txUUID, "tx_number", runID)
+
+			result := TransactionResult{
+				TxID:  txUUID,
+				RunID: runID,
+			}
+
+			outputs := []Output{
+				{
+					ParticipantCode:      "ZHH1NA",
+					Amount:               "179400",
+					ZeroHashID:           txUUID,
+					SourceDerivationPath: "59",
+					DestinationAddress:   "9WotpYvQ9YwMKhbCUKnJGWuJjaZMvqfiTMXebUTTQURb",
+					PlatformCode:         "H552SV",
+					WithdrawalRequestID:  txUUID,
+				},
+			}
+
+			// Create the request using the helper function
+			request := CreateSolanaSignRequest(
+				txUUID,
+				fmt.Sprintf("WITHDRAWAL:%s", txUUID),
+				"SOL",
+				"HIGH",
+				"WITHDRAWAL",
+				outputs,
+				10,
+			)
+
+			// PHASE 1: Call the SignTransaction function
+			signStartTime := time.Now()
+			_, err := SignTransaction(ctx, baseURL, request)
+			if err != nil {
+				result.Error = fmt.Errorf("transaction flow failed: %w", err)
+				results <- result
+				return
+			}
+			result.SignDuration = time.Since(signStartTime)
+
+			// PHASE 2: Monitor docker logs for transaction completion
+			logMonitorStartTime := time.Now()
+			containerName := "blockchain-solana-service-solana-signer"
+			logState, err := MonitorDockerLogs(ctx, containerName, txUUID, 5*time.Minute)
+			if err != nil {
+				result.Error = fmt.Errorf("failed to monitor transaction completion: %w", err)
+				results <- result
+				return
+			}
+			result.LogMonitorDuration = time.Since(logMonitorStartTime)
+			result.LogState = logState
+			result.TotalDuration = time.Since(txStartTime)
+
+			// Send result to channel
+			results <- result
+		}(runID + 1)
+	}
+
+	// Close results channel when all goroutines are done
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect and process results
 	var totalTxDurations []time.Duration
 	var signDurations []time.Duration
 	var logMonitorDurations []time.Duration
 	var blockchainProcessingDurations []time.Duration
+	successCount := 0
 
-	// Run specified number of transactions
-	for i := 0; i < numTransactions; i++ {
-		runID := i + 1
-		slog.Info("Starting transaction batch", "tx_number", runID, "of", numTransactions)
-
-		// Start the overall transaction timing
-		txStartTime := time.Now()
-
-		// Generate a unique transaction ID (UUID)
-		txUUID := uuid.New().String()
-		slog.Info("Starting transaction flow", "tx_id", txUUID, "tx_number", runID)
-
-		outputs := []Output{
-			{
-				ParticipantCode:      "ZHH1NA",
-				Amount:               "179400",
-				ZeroHashID:           txUUID,
-				SourceDerivationPath: "59",
-				DestinationAddress:   "9WotpYvQ9YwMKhbCUKnJGWuJjaZMvqfiTMXebUTTQURb",
-				PlatformCode:         "H552SV",
-				WithdrawalRequestID:  txUUID,
-			},
-		}
-
-		// Create the request using the helper function
-		request := CreateSolanaSignRequest(
-			txUUID,
-			fmt.Sprintf("WITHDRAWAL:%s", txUUID),
-			"SOL",
-			"HIGH",
-			"WITHDRAWAL",
-			outputs,
-			10,
-		)
-
-		// PHASE 1: Call the SignTransaction function
-		signStartTime := time.Now()
-		_, err := SignTransaction(ctx, baseURL, request)
-		if err != nil {
-			slog.Error("Transaction flow failed", "tx_id", txUUID, "error", err, "tx_number", runID)
+	for result := range results {
+		if result.Error != nil {
+			slog.Error("Transaction failed",
+				"tx_id", result.TxID,
+				"tx_number", result.RunID,
+				"error", result.Error)
 			continue
 		}
-		signDuration := time.Since(signStartTime)
-		signDurations = append(signDurations, signDuration)
 
-		// PHASE 2: Monitor docker logs for transaction completion
-		logMonitorStartTime := time.Now()
-		containerName := "blockchain-solana-service-solana-signer"
-		logState, err := MonitorDockerLogs(ctx, containerName, txUUID, 5*time.Minute)
-		if err != nil {
-			slog.Error("Failed to monitor transaction completion", "tx_id", txUUID, "error", err, "tx_number", runID)
-			continue
-		}
-		logMonitorDuration := time.Since(logMonitorStartTime)
-		logMonitorDurations = append(logMonitorDurations, logMonitorDuration)
+		successCount++
+		totalTxDurations = append(totalTxDurations, result.TotalDuration)
+		signDurations = append(signDurations, result.SignDuration)
+		logMonitorDurations = append(logMonitorDurations, result.LogMonitorDuration)
+		blockchainProcessingDurations = append(blockchainProcessingDurations, result.TotalDuration-result.SignDuration)
 
-		// Calculate total transaction duration
-		totalDuration := time.Since(txStartTime)
-		totalTxDurations = append(totalTxDurations, totalDuration)
-		blockchainProcessingDurations = append(blockchainProcessingDurations, totalDuration-signDuration)
-
-		// Transaction completed successfully
 		slog.Info("Transaction completed successfully",
-			"tx_id", txUUID,
-			"state", logState.State,
-			"txHash", logState.TxHash,
-			"tx_number", runID,
-			"total_duration_ms", totalDuration.Milliseconds(),
-			"sign_duration_ms", signDuration.Milliseconds(),
-			"log_monitor_duration_ms", logMonitorDuration.Milliseconds(),
-			"blockchain_processing_ms", (totalDuration - signDuration).Milliseconds())
+			"tx_id", result.TxID,
+			"state", result.LogState.State,
+			"txHash", result.LogState.TxHash,
+			"tx_number", result.RunID,
+			"total_duration_ms", result.TotalDuration.Milliseconds(),
+			"sign_duration_ms", result.SignDuration.Milliseconds(),
+			"log_monitor_duration_ms", result.LogMonitorDuration.Milliseconds(),
+			"blockchain_processing_ms", (result.TotalDuration - result.SignDuration).Milliseconds())
 	}
 
 	// Calculate and print average times
-	if len(totalTxDurations) > 0 {
+	if successCount > 0 {
 		var totalAvg, signAvg, logAvg, blockchainAvg int64
 
 		for _, d := range totalTxDurations {
 			totalAvg += d.Milliseconds()
 		}
-		totalAvg /= int64(len(totalTxDurations))
+		totalAvg /= int64(successCount)
 
 		for _, d := range signDurations {
 			signAvg += d.Milliseconds()
 		}
-		signAvg /= int64(len(signDurations))
+		signAvg /= int64(successCount)
 
 		for _, d := range logMonitorDurations {
 			logAvg += d.Milliseconds()
 		}
-		logAvg /= int64(len(logMonitorDurations))
+		logAvg /= int64(successCount)
 
 		for _, d := range blockchainProcessingDurations {
 			blockchainAvg += d.Milliseconds()
 		}
-		blockchainAvg /= int64(len(blockchainProcessingDurations))
+		blockchainAvg /= int64(successCount)
 
 		slog.Info("Transaction timing summary",
-			"transactions_completed", len(totalTxDurations),
+			"transactions_completed", successCount,
 			"avg_total_duration_ms", totalAvg,
 			"avg_sign_duration_ms", signAvg,
 			"avg_log_monitor_duration_ms", logAvg,
@@ -547,4 +596,13 @@ func main() {
 	} else {
 		slog.Error("No transactions completed successfully")
 	}
+
+	// Log total batch duration
+	batchDuration := time.Since(batchStartTime)
+	slog.Info("Total batch execution completed",
+		"total_duration_ms", batchDuration.Milliseconds(),
+		"total_duration_human", batchDuration.String(),
+		"transactions_attempted", numTransactions,
+		"transactions_succeeded", successCount,
+		"success_rate_percent", float64(successCount)/float64(numTransactions)*100)
 }
